@@ -1,7 +1,9 @@
 import os
-import cv2
-import numpy as np
 import csv
+from PIL import Image, ImageOps
+import io
+import numpy as np
+import cv2
 
 try:
     import fitz  # PyMuPDF (opcional, pra ler PDF em teste local)
@@ -100,11 +102,24 @@ def carregar_imagem(path: str, dpi: int = 220) -> np.ndarray:
 
 # ✅ Para o FRONT: carregar imagem direto de bytes (upload)
 def carregar_imagem_bytes(file_bytes: bytes) -> np.ndarray:
-    arr = np.frombuffer(file_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Não foi possível decodificar a imagem enviada.")
-    return img
+    try:
+        # abre com PIL
+        img = Image.open(io.BytesIO(file_bytes))
+
+        # corrige orientação EXIF (CRÍTICO para iPhone)
+        img = ImageOps.exif_transpose(img)
+
+        # converte para RGB
+        img = img.convert("RGB")
+
+        # PIL -> OpenCV (BGR)
+        img_np = np.array(img)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        return img_bgr
+
+    except Exception as e:
+        raise ValueError(f"Erro ao decodificar imagem (EXIF): {e}")
 
 
 # =========================
