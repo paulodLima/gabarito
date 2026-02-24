@@ -1,34 +1,38 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import json
-import os
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from typing import List, Dict, Optional
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file
+import json
 import zipfile
 
 # ✅ IMPORTA DO SEU ARQUIVO DE PROCESSAMENTO (ajuste se o nome do arquivo for outro)
-from gerar_gabarito import (
-    gerar_pdf_cartao,
-    PROVA_DATA,
-    PROVA_SEQ_START
-)
+from gerar_gabarito import gerar_pdf_cartao, PROVA_DATA, PROVA_SEQ_START
 
 from ler_gabarito import (
     ler_gabarito_csv,
     carregar_imagem_bytes,
     corrigir_imagem,
 )
-app = Flask(__name__)
+
+app = FastAPI()
+
+# CORS (depois a gente restringe pro seu domínio do Firebase)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 OUT_BASE = BASE_DIR / "saida_api"
+OUT_BASE.mkdir(parents=True, exist_ok=True)
 
-# ✅ AJUSTE este caminho para onde está seu CSV do gabarito
 GABARITO_CSV_PATH = BASE_DIR / "resposta" / "gabarito.csv"
-
-# ✅ Cache do gabarito pra não ler o CSV a cada request
 _GABARITO_CACHE = None
 
 
@@ -39,23 +43,24 @@ def get_gabarito():
             raise FileNotFoundError(f"Gabarito CSV não encontrado: {GABARITO_CSV_PATH}")
         _GABARITO_CACHE = ler_gabarito_csv(str(GABARITO_CSV_PATH))
     return _GABARITO_CACHE
-app = FastAPI()
 
-# CORS: enquanto testa, deixe aberto. Depois eu te mostro como travar no seu domínio.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
+# =========================
+# /gerar
+# =========================
+class TurmaReq(BaseModel):
+    serie: str
+    turma: str
+    quantidade: int
+
+
 @app.post("/gerar")
-def gerar():
+def gerar(turmas: List[TurmaReq]):
     """
     Recebe JSON no formato:
     [
@@ -64,38 +69,25 @@ def gerar():
     ]
     Retorna um zip com os PDFs.
     """
-    turmas = request.get_json(silent=True)
 
-    if not isinstance(turmas, list) or len(turmas) == 0:
-        return jsonify({"error": "Envie um JSON array com turmas"}), 400
+    if not turmas:
+        return JSONResponse({"error": "Envie um JSON array com turmas"}, status_code=400)
 
     # valida mínimo
     for t in turmas:
-        if not isinstance(t, dict):
-            return jsonify({"error": "Cada item deve ser objeto"}), 400
-        if not str(t.get("serie", "")).strip():
-            return jsonify({"error": "Campo 'serie' obrigatório"}), 400
-        if not str(t.get("turma", "")).strip():
-            return jsonify({"error": "Campo 'turma' obrigatório"}), 400
-        try:
-            qtd = int(t.get("quantidade", 0))
-        except Exception:
-            return jsonify({"error": "Campo 'quantidade' deve ser número"}), 400
-        if qtd <= 0:
-            return jsonify({"error": "Campo 'quantidade' deve ser > 0"}), 400
+        if int(t.quantidade) <= 0:
+            return JSONResponse({"error": "Campo 'quantidade' deve ser > 0"}, status_code=400)
 
-    # cria pasta por job
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out_dir = OUT_BASE / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     contador_global = PROVA_SEQ_START
 
-    # gera PDFs
     for turma in turmas:
-        serie = str(turma["serie"]).strip()
-        nome_turma = str(turma["turma"]).strip()
-        qtd = int(turma["quantidade"])
+        serie = turma.serie.strip()
+        nome_turma = turma.turma.strip()
+        qtd = int(turma.quantidade)
 
         for i in range(1, qtd + 1):
             numero = str(i)
@@ -107,73 +99,75 @@ def gerar():
             gerar_pdf_cartao(str(out_file), serie, nome_turma, numero)
             contador_global += 1
 
-    # cria ZIP
     zip_path = OUT_BASE / f"cartoes_{job_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for pdf in out_dir.glob("*.pdf"):
             z.write(pdf, arcname=pdf.name)
 
-    return send_file(zip_path, as_attachment=True, download_name=zip_path.name)
+    return FileResponse(
+        path=str(zip_path),
+        filename=zip_path.name,
+        media_type="application/zip",
+    )
 
 
+# =========================
+# /corrigir
+# =========================
 @app.post("/corrigir")
-def corrigir():
-    # 1) arquivo
-    if "file" not in request.files:
-        return jsonify({"error": "Envie o arquivo no campo 'file'"}), 400
+async def corrigir(
+        file: UploadFile = File(...),
+        gabarito: str = Form(...),
+        serie: Optional[str] = Form(""),
+        turma: Optional[str] = Form(""),
+        provaId: Optional[str] = Form(""),
+):
+    """
+    multipart/form-data:
+      - file: arquivo (imagem/pdf)
+      - gabarito: string JSON (ex: {"1":"A","2":"B"...})
+      - serie/turma/provaId (opcional)
+    """
 
-    f = request.files["file"]
-    if not f or f.filename == "":
-        return jsonify({"error": "Arquivo inválido"}), 400
-
-    # 2) gabarito (vem como string JSON no multipart)
-    gabarito_raw = request.form.get("gabarito", "")
-    if not gabarito_raw:
-        return jsonify({"error": "Envie o gabarito no campo 'gabarito'"}), 400
-
+    # 1) gabarito
     try:
-        gabarito_dict = json.loads(gabarito_raw)
+        gabarito_dict = json.loads(gabarito)
     except Exception:
-        return jsonify({"error": "Campo 'gabarito' deve ser um JSON válido"}), 400
+        return JSONResponse({"error": "Campo 'gabarito' deve ser um JSON válido"}, status_code=400)
 
     if not isinstance(gabarito_dict, dict) or len(gabarito_dict) == 0:
-        return jsonify({"error": "Gabarito inválido (envie um objeto com {\"1\":\"A\", ...})"}), 400
+        return JSONResponse({"error": "Gabarito inválido (envie um objeto com {\"1\":\"A\", ...})"}, status_code=400)
 
-    # 3) normaliza gabarito -> {int: "A"}
     alternativas_validas = {"A", "B", "C", "D", "E"}
-    gabarito: dict[int, str] = {}
+    gabarito_norm: Dict[int, str] = {}
 
     for k, v in gabarito_dict.items():
         try:
             q = int(k)
         except Exception:
-            return jsonify({"error": f"Chave de questão inválida no gabarito: {k!r}"}), 400
+            return JSONResponse({"error": f"Chave de questão inválida no gabarito: {k!r}"}, status_code=400)
 
         resp = str(v).strip().upper()
         if resp not in alternativas_validas:
-            return jsonify({"error": f"Resposta inválida na questão {q}: {resp!r} (use A..E)"}), 400
+            return JSONResponse({"error": f"Resposta inválida na questão {q}: {resp!r} (use A..E)"}, status_code=400)
 
-        gabarito[q] = resp
+        gabarito_norm[q] = resp
 
-    # 4) decodifica imagem e corrige
+    # 2) lê arquivo
     try:
-        img = carregar_imagem_bytes(f.read())
-
-        # opcional: metadados enviados pelo Next (se você mandar)
-        serie = request.form.get("serie", "")
-        turma = request.form.get("turma", "")
-        prova_id = request.form.get("provaId", "")
+        content = await file.read()
+        img = carregar_imagem_bytes(content)
 
         resultado = corrigir_imagem(
             imagem_bgr=img,
-            gabarito_correto=gabarito,
+            gabarito_correto=gabarito_norm,
             usar_marcadores_cartao=True,
-            serie=serie,
-            turma=turma,
-            prova_id=prova_id,
+            serie=serie or "",
+            turma=turma or "",
+            prova_id=provaId or "",
         )
 
-        return jsonify(resultado)
+        return JSONResponse(resultado)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return JSONResponse({"error": str(e)}, status_code=500)
