@@ -289,6 +289,10 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
     gray = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    hsv = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2HSV)
+    S = hsv[:, :, 1]  # saturação
+    V = hsv[:, :, 2]
+
     # Hough: minDist menor ajuda quando tem 5 colunas
     circles = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT,
@@ -306,8 +310,14 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
     for (x, y, r) in circles:
         mask = np.zeros(gray.shape, dtype=np.uint8)
         cv2.circle(mask, (x, y), max(r - 4, 1), 255, -1)
-        mean = cv2.mean(gray, mask=mask)[0]  # menor = mais escuro
-        bolhas.append((x, y, r, mean))
+
+        mean_gray = cv2.mean(gray, mask=mask)[0]  # preto ajuda
+        mean_s = cv2.mean(S, mask=mask)[0]        # azul ajuda (tinta)
+        mean_v = cv2.mean(V, mask=mask)[0]
+
+        score = (0.90 * mean_s) + (0.35 * (255.0 - mean_v)) + (0.25 * (255.0 - mean_gray))
+
+        bolhas.append((x, y, r, score))
 
     # --------
     # 1) AGRUPAR POR LINHAS (Y) SEM KMEANS
@@ -370,8 +380,8 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
         if len(row) < num_alts:
             continue
 
-        means = [t[3] for t in row]  # mean gray
-        order = np.argsort(means)    # menor = mais escuro
+        scores = [t[3] for t in row]  # mean gray
+        order = np.argsort(scores)[::-1]   # menor = mais escuro
         best = order[0]
         second = order[1]
 
@@ -380,7 +390,7 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
         # Se a melhor não estiver bem mais escura que a segunda, ignora.
         # Ajuste esses números se precisar.
         # --------
-        if (means[second] - means[best]) < 8:  # diferença mínima
+        if (scores[best] - scores[second]) < 8:  # diferença mínima
             continue
 
         respostas[idx_q] = alternativas[best]
