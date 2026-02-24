@@ -304,7 +304,10 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
     gray = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Hough: minDist menor ajuda quando tem 5 colunas
+    hsv = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2HSV)
+    S = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)  # saturação
+    V = cv2.GaussianBlur(hsv[:, :, 2], (5, 5), 0)  # brilho
+
     circles = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT,
         dp=1.2, minDist=18,
@@ -320,9 +323,16 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
     bolhas = []
     for (x, y, r) in circles:
         mask = np.zeros(gray.shape, dtype=np.uint8)
+
         cv2.circle(mask, (x, y), max(r - 4, 1), 255, -1)
-        mean = cv2.mean(gray, mask=mask)[0]  # menor = mais escuro
-        bolhas.append((x, y, r, mean))
+        mean_gray = cv2.mean(gray, mask=mask)[0]  # preto ajuda (fica baixo)
+        mean_s    = cv2.mean(S, mask=mask)[0]     # azul ajuda (fica alto)
+        mean_v    = cv2.mean(V, mask=mask)[0]     # tinta tende a reduzir V
+
+        # score maior = mais marcado (azul ou preto)
+        score = (0.95 * mean_s) + (0.55 * (255.0 - mean_v)) + (0.35 * (255.0 - mean_gray))
+
+        bolhas.append((x, y, r, score))
 
     # --------
     # 1) AGRUPAR POR LINHAS (Y) SEM KMEANS
@@ -385,17 +395,13 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
         if len(row) < num_alts:
             continue
 
-        means = [t[3] for t in row]  # mean gray
-        order = np.argsort(means)    # menor = mais escuro
+        scores = [t[3] for t in row]
+        order = np.argsort(scores)[::-1]  # maior = mais marcado
         best = order[0]
         second = order[1]
 
-        # --------
-        # 3) (Opcional mas recomendado) filtro para "questão em branco"
-        # Se a melhor não estiver bem mais escura que a segunda, ignora.
-        # Ajuste esses números se precisar.
-        # --------
-        if (means[second] - means[best]) < 4:  # diferença mínima
+        # diferença mínima para evitar marcar em branco
+        if (scores[best] - scores[second]) < 7:
             continue
 
         respostas[idx_q] = alternativas[best]
