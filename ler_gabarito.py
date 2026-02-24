@@ -2,21 +2,19 @@ import os
 import cv2
 import numpy as np
 import csv
-import json
-import itertools
 
 try:
-    import fitz  # PyMuPDF
+    import fitz  # PyMuPDF (opcional, pra ler PDF em teste local)
 except ImportError:
     fitz = None
 
-alternativas = ["A", "B", "C", "D"]
+alternativas = ["A", "B", "C", "D", "E"]
 
 
 # =========================
 # 1) LER GABARITO DO CSV
 # =========================
-def ler_gabarito_csv(caminho_csv: str) -> dict:
+def ler_gabarito_csv(caminho_csv: str) -> dict[int, str]:
     if not os.path.exists(caminho_csv):
         raise FileNotFoundError(f"CSV não encontrado: {caminho_csv}")
 
@@ -41,7 +39,7 @@ def ler_gabarito_csv(caminho_csv: str) -> dict:
         if not col_q or not col_r:
             raise ValueError(f"CSV precisa ter colunas 'questao' e 'resposta'. Headers: {headers}")
 
-        gabarito = {}
+        gabarito: dict[int, str] = {}
         for i, row in enumerate(reader, start=2):
             q_raw = (row.get(col_q) or "").strip()
             r_raw = (row.get(col_r) or "").strip().upper()
@@ -66,7 +64,7 @@ def ler_gabarito_csv(caminho_csv: str) -> dict:
 
 
 # =========================
-# 2) CARREGAR IMAGEM (PNG/JPG) OU PDF
+# 2) CARREGAR IMAGEM (arquivo) OU PDF (opcional)
 # =========================
 def carregar_imagem(path: str, dpi: int = 220) -> np.ndarray:
     if not os.path.exists(path):
@@ -100,47 +98,17 @@ def carregar_imagem(path: str, dpi: int = 220) -> np.ndarray:
     raise ValueError(f"Extensão não suportada: {ext}")
 
 
-# =========================
-# 3) LER QR CODE (JSON)
-# =========================
-def ler_payload_qr_opencv(imagem_bgr: np.ndarray) -> dict | None:
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(imagem_bgr)
-    if data:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            return {"raw": data}
-
-    gray = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2GRAY)
-    _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    data, _, _ = detector.detectAndDecode(thr)
-    if data:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            return {"raw": data}
-    return None
-
-
-def recortar_area_qr(imagem_bgr: np.ndarray, reserva_direita_px: int = 360, y0_px: int = 140, altura_px: int = 520) -> np.ndarray:
-    h, w = imagem_bgr.shape[:2]
-    x0 = max(w - reserva_direita_px, 0)
-    y0 = min(max(y0_px, 0), h)
-    y1 = min(y0 + altura_px, h)
-    return imagem_bgr[y0:y1, x0:w]
-
-
-def ler_payload_qr(imagem_bgr: np.ndarray) -> dict | None:
-    roi = recortar_area_qr(imagem_bgr)
-    payload = ler_payload_qr_opencv(roi)
-    if payload:
-        return payload
-    return ler_payload_qr_opencv(imagem_bgr)
+# ✅ Para o FRONT: carregar imagem direto de bytes (upload)
+def carregar_imagem_bytes(file_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(file_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Não foi possível decodificar a imagem enviada.")
+    return img
 
 
 # =========================
-# 4) RETIFICAR PELOS QUADRADOS DO CARTÃO (CORRIGIDO)
+# 3) RETIFICAR PELOS 4 QUADRADOS (AGORA DENTRO DO CARTÃO)
 # =========================
 def _ordenar_pontos_quadrilatero(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype=np.float32)
@@ -154,56 +122,61 @@ def _ordenar_pontos_quadrilatero(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def _quad_valido(rect: np.ndarray, area_min: float = 20000.0) -> bool:
-    # sem pontos repetidos
+def _quad_valido(rect: np.ndarray, area_min: float = 15000.0) -> bool:
     if len(np.unique(rect.round(1), axis=0)) < 4:
         return False
-    # área mínima
+
     area = abs(cv2.contourArea(rect.astype(np.float32)))
     if area < area_min:
         return False
-    # lados mínimos (evita colapsar)
+
     tl, tr, br, bl = rect
     w1 = np.linalg.norm(tr - tl)
     w2 = np.linalg.norm(br - bl)
     h1 = np.linalg.norm(bl - tl)
     h2 = np.linalg.norm(br - tr)
-    if min(w1, w2, h1, h2) < 80:
+    if min(w1, w2, h1, h2) < 200:
         return False
     return True
 
 
 def encontrar_marcadores_cartao(imagem_bgr: np.ndarray):
     """
-    CORRIGIDO:
-    - detecta quadrados pretos na ROI do cartão
-    - pega os 4 MAIORES (os marcadores reais)
-    - ordena e valida
+    Detecta os 4 quadrados pretos PREENCHIDOS (marcadores) dentro do cartão.
+    Estratégia:
+    - recorta ROI do meio/baixo
+    - threshold invertido (preto vira branco)
+    - procura contornos quadrados com boa "preenchimento"
+    - pega os 4 melhores por área
     """
     h, w = imagem_bgr.shape[:2]
 
-    # ROI: região provável do cartão (meio/parte de baixo)
-    x1 = int(w * 0.10)
-    x2 = int(w * 0.90)
-    y1 = int(h * 0.35)
+    # ROI: região provável do cartão (ajustável)
+    x1 = int(w * 0.08)
+    x2 = int(w * 0.92)
+    y1 = int(h * 0.25)
     y2 = int(h * 0.92)
+
     roi = imagem_bgr[y1:y2, x1:x2].copy()
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # limpa ruído
     th = cv2.medianBlur(th, 5)
 
     contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    squares = []
+    candidates = []
     roi_h, roi_w = gray.shape[:2]
     img_area = roi_w * roi_h
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < img_area * 0.00015:
+        if area < img_area * 0.00010:   # menor (marcadores agora menores)
             continue
-        if area > img_area * 0.03:
+        if area > img_area * 0.020:
             continue
 
         peri = cv2.arcLength(cnt, True)
@@ -216,16 +189,26 @@ def encontrar_marcadores_cartao(imagem_bgr: np.ndarray):
         if not (0.80 <= aspect <= 1.25):
             continue
 
+        # "preenchimento" (solidity): quadrado preenchido tende a ser alto
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull) if hull is not None else 0
+        if hull_area <= 0:
+            continue
+        solidity = area / hull_area
+        if solidity < 0.85:
+            continue
+
         cx = x + ww / 2.0
         cy = y + hh / 2.0
-        squares.append((area, (cx + x1, cy + y1)))
 
-    if len(squares) < 4:
+        # salva com área + posição (volta pro sistema da imagem original)
+        candidates.append((area, (cx + x1, cy + y1)))
+
+    if len(candidates) < 4:
         return None
 
-    # ✅ pegue os 4 maiores => marcadores reais
-    squares.sort(key=lambda t: -t[0])
-    pts = np.array([p for _, p in squares[:4]], dtype=np.float32)
+    candidates.sort(key=lambda t: -t[0])
+    pts = np.array([p for _, p in candidates[:4]], dtype=np.float32)
     rect = _ordenar_pontos_quadrilatero(pts)
 
     if not _quad_valido(rect):
@@ -249,8 +232,8 @@ def retificar_cartao_por_marcadores(imagem_bgr: np.ndarray, escala: float = 1.0)
     heightB = np.linalg.norm(tl - bl)
     maxH = int(max(heightA, heightB) * escala)
 
-    maxW = max(maxW, 600)
-    maxH = max(maxH, 600)
+    maxW = max(maxW, 650)
+    maxH = max(maxH, 650)
 
     dst = np.array([
         [0, 0],
@@ -264,7 +247,7 @@ def retificar_cartao_por_marcadores(imagem_bgr: np.ndarray, escala: float = 1.0)
 
 
 # =========================
-# 5) DETECTAR RESPOSTAS (CÍRCULOS) - igual ao seu
+# 4) DETECTAR RESPOSTAS (CÍRCULOS)
 # =========================
 def _kmeans_1d(values: np.ndarray, k: int, iters: int = 30):
     values = values.astype(np.float32).reshape(-1)
@@ -293,17 +276,23 @@ def _kmeans_1d(values: np.ndarray, k: int, iters: int = 30):
     labels = np.argmin(d, axis=1)
     return centers, labels
 
+import cv2
+import numpy as np
 
 def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
+    alternativas = ["A", "B", "C", "D", "E"]
+    num_alts = len(alternativas)
+
     if imagem_bgr is None:
         return {}
 
     gray = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    # Hough: minDist menor ajuda quando tem 5 colunas
     circles = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT,
-        dp=1.2, minDist=28,
+        dp=1.2, minDist=18,
         param1=60, param2=26,
         minRadius=9, maxRadius=26
     )
@@ -312,116 +301,170 @@ def detectar_respostas(imagem_bgr: np.ndarray, total_questoes: int):
 
     circles = np.round(circles[0, :]).astype(int)
 
-    data = []
+    # mede "escuro" de cada círculo
+    bolhas = []
     for (x, y, r) in circles:
         mask = np.zeros(gray.shape, dtype=np.uint8)
         cv2.circle(mask, (x, y), max(r - 4, 1), 255, -1)
-        mean = cv2.mean(gray, mask=mask)[0]
-        data.append((x, y, r, mean))
+        mean = cv2.mean(gray, mask=mask)[0]  # menor = mais escuro
+        bolhas.append((x, y, r, mean))
 
-    xs = np.array([d[0] for d in data], dtype=np.float32)
-    ys = np.array([d[1] for d in data], dtype=np.float32)
+    # --------
+    # 1) AGRUPAR POR LINHAS (Y) SEM KMEANS
+    # --------
+    bolhas.sort(key=lambda t: t[1])  # ordena por Y
 
-    cx, lx = _kmeans_1d(xs, k=len(alternativas))
-    order_x = np.argsort(cx)
-    map_x = {int(order_x[i]): i for i in range(len(order_x))}
+    ys = np.array([b[1] for b in bolhas], dtype=np.float32)
+    if len(ys) < total_questoes * num_alts:
+        # ainda dá pra tentar, mas aviso mental: faltou detecção
+        pass
 
-    cy, ly = _kmeans_1d(ys, k=total_questoes)
-    order_y = np.argsort(cy)
-    map_y = {int(order_y[i]): i for i in range(len(order_y))}
+    # estima espaçamento vertical típico
+    diffs = np.diff(np.sort(ys))
+    diffs = diffs[diffs > 1]  # remove zeros/ruído
+    esp_y = np.median(diffs) if len(diffs) else 25.0
+    tol_y = max(10.0, 0.55 * esp_y)  # tolerância para ser "mesma linha"
 
-    grid = {}
-    for (x, y, r, mean), clx, cly in zip(data, lx, ly):
-        alt_idx = map_x.get(int(clx))
-        q_idx = map_y.get(int(cly))
-        if alt_idx is None or q_idx is None:
+    linhas = []
+    linha_atual = []
+    y_ref = None
+
+    for b in bolhas:
+        x, y, r, mean = b
+        if y_ref is None:
+            linha_atual = [b]
+            y_ref = y
             continue
-        key = (q_idx, alt_idx)
-        if key not in grid or mean < grid[key]:
-            grid[key] = mean
+
+        if abs(y - y_ref) <= tol_y:
+            linha_atual.append(b)
+            # atualiza referência suavemente
+            y_ref = 0.7 * y_ref + 0.3 * y
+        else:
+            linhas.append(linha_atual)
+            linha_atual = [b]
+            y_ref = y
+
+    if linha_atual:
+        linhas.append(linha_atual)
+
+    # ordena linhas por y médio e pega as primeiras total_questoes
+    linhas.sort(key=lambda row: np.mean([t[1] for t in row]))
+    linhas = linhas[:total_questoes]
 
     respostas = {}
-    for q_idx in range(min(total_questoes, len(order_y))):
-        candidatos = []
-        for alt_idx in range(len(alternativas)):
-            mean = grid.get((q_idx, alt_idx))
-            if mean is not None:
-                candidatos.append((alt_idx, mean))
 
-        if not candidatos:
+    # --------
+    # 2) PARA CADA LINHA: ordenar por X -> A..E
+    # --------
+    for idx_q, row in enumerate(linhas, start=1):
+        # remove possíveis "sobras" se o Hough pegou círculos extra:
+        # mantém os 5 mais próximos do centro da linha (por Y)
+        y_m = np.mean([t[1] for t in row])
+        row.sort(key=lambda t: abs(t[1] - y_m))
+        row = row[:num_alts]
+
+        # agora ordena por X (A..E)
+        row.sort(key=lambda t: t[0])
+
+        if len(row) < num_alts:
             continue
 
-        candidatos.sort(key=lambda t: t[1])
-        respostas[q_idx + 1] = alternativas[candidatos[0][0]]
+        means = [t[3] for t in row]  # mean gray
+        order = np.argsort(means)    # menor = mais escuro
+        best = order[0]
+        second = order[1]
+
+        # --------
+        # 3) (Opcional mas recomendado) filtro para "questão em branco"
+        # Se a melhor não estiver bem mais escura que a segunda, ignora.
+        # Ajuste esses números se precisar.
+        # --------
+        if (means[second] - means[best]) < 8:  # diferença mínima
+            continue
+
+        respostas[idx_q] = alternativas[best]
 
     return respostas
 
+def _centros_por_gaps(valores: np.ndarray, k_esperado: int):
+    v = np.sort(valores.astype(np.float32))
+    if len(v) < k_esperado:
+        return None
 
+    diffs = np.diff(v)
+    if len(diffs) == 0:
+        return None
+
+    med = np.median(diffs)
+    if med <= 0:
+        return None
+
+    limiar_gap = 2.2 * med
+    cortes = np.where(diffs > limiar_gap)[0]
+
+    grupos = []
+    ini = 0
+    for c in cortes:
+        grupos.append(v[ini:c+1])
+        ini = c+1
+    grupos.append(v[ini:])
+
+    if len(grupos) != k_esperado:
+        return None
+
+    centros = np.array([g.mean() for g in grupos], dtype=np.float32)
+    return np.sort(centros)
 # =========================
-# 6) CORRIGIR (PDF/IMG)
+# 5) CORRIGIR (IMAGEM)
 # =========================
-def corrigir_arquivo(caminho: str, gabarito_correto: dict, usar_marcadores_cartao: bool = True, aluno_fallback: str = ""):
+def corrigir_imagem(
+        imagem_bgr: np.ndarray,
+        gabarito_correto: dict[int, str],
+        usar_marcadores_cartao: bool = True,
+        aluno: str = "",
+        serie: str = "",
+        turma: str = "",
+        prova_id: str = ""
+):
     gabarito_correto = {int(k): str(v).upper() for k, v in gabarito_correto.items()}
-    imagem = carregar_imagem(caminho, dpi=220)
 
-    # QR na imagem ORIGINAL
-    payload = ler_payload_qr(imagem)
-    aluno = aluno_fallback
-    serie = ""
-    turma = ""
-    prova_id = ""
-
-    if payload:
-        aluno = (payload.get("aluno") or aluno_fallback or "").strip()
-        serie = (payload.get("serie") or "").strip()
-        turma = (payload.get("turma") or "").strip()
-        prova_id = (payload.get("provaId") or "").strip()
-
-    imagem_cartao = imagem
+    imagem_cartao = imagem_bgr
     marcadores_ok = False
 
     if usar_marcadores_cartao:
-        warped = retificar_cartao_por_marcadores(imagem)
+        warped = retificar_cartao_por_marcadores(imagem_bgr)
         if warped is not None:
             imagem_cartao = warped
             marcadores_ok = True
 
-    respostas_lidas = detectar_respostas(imagem_cartao, total_questoes=len(gabarito_correto))
+    total_questoes = max(gabarito_correto.keys())
+    respostas_lidas = detectar_respostas(imagem_cartao, total_questoes=total_questoes)
 
     certas = 0
     erradas = 0
-    detalhes = {}
 
     for q, resp_correta in gabarito_correto.items():
         resp_aluno = respostas_lidas.get(q)
         if resp_aluno == resp_correta:
             certas += 1
-            detalhes[q] = {"resposta": resp_aluno, "status": "correta"}
         else:
             erradas += 1
-            detalhes[q] = {"resposta": resp_aluno or "sem resposta", "status": "errada"}
 
     return {
-        "arquivo": os.path.basename(caminho),
-        "aluno": aluno,
-        "serie": serie,
-        "turma": turma,
-        "provaId": prova_id,
+        "marcadoresOk": marcadores_ok,
         "certas": certas,
         "erradas": erradas,
         "total": len(gabarito_correto),
-        "detalhes": detalhes,
-        "respostas_lidas": respostas_lidas,
-        "qr_payload": payload,
-        "marcadores_cartao_ok": marcadores_ok,
+        "respostasLidas": respostas_lidas,
     }
 
 
 # =========================
-# 7) EXECUÇÃO EM LOTE
+# 6) TESTE LOCAL (opcional)
 # =========================
 if __name__ == "__main__":
-    PASTA = os.path.abspath("./saida_pdfs")
+    PASTA = os.path.abspath("./respostas")  # pasta com as fotos
     CAMINHO_CSV_GABARITO = os.path.abspath("./resposta/gabarito.csv")
 
     gabarito = ler_gabarito_csv(CAMINHO_CSV_GABARITO)
@@ -436,25 +479,16 @@ if __name__ == "__main__":
     print(f"🔍 Encontrados {len(arquivos)} arquivos para correção")
     print(f"✅ Gabarito carregado ({len(gabarito)} questões)\n")
 
-    for nome in arquivos:
+    for nome in sorted(arquivos):
         caminho = os.path.join(PASTA, nome)
         try:
-            resultado = corrigir_arquivo(
-                caminho=caminho,
-                gabarito_correto=gabarito,
-                usar_marcadores_cartao=True,
-                aluno_fallback=""
-            )
+            img = carregar_imagem(caminho, dpi=220)
+            resultado = corrigir_imagem(img, gabarito, usar_marcadores_cartao=True)
 
-            print("📄 Arquivo:", resultado["arquivo"])
-            print("Aluno:", resultado["aluno"] or "(não lido do QR)")
-            print("Série:", resultado["serie"], "| Turma:", resultado["turma"])
-            print("ProvaId:", resultado["provaId"])
-            print("Marcadores cartão OK:", resultado["marcadores_cartao_ok"])
+            print("📄 Arquivo:", nome)
+            print("Marcadores OK:", resultado["marcadoresOk"])
             print("Certas:", resultado["certas"], "| Erradas:", resultado["erradas"], "| Total:", resultado["total"])
-            print("Respostas lidas:", resultado["respostas_lidas"])
-            if not resultado["qr_payload"]:
-                print("⚠️ QR não foi lido")
+            print("Respostas lidas:", resultado["respostasLidas"])
             print("-" * 60)
 
         except Exception as e:

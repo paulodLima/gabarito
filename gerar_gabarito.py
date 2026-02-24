@@ -1,37 +1,19 @@
 import os
 import csv
-import json
 from pathlib import Path
-from io import BytesIO
-
-import qrcode
+import json
+import argparse
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 
 
-def perguntar_quantidade_questoes():
-    while True:
-        try:
-            q = int(input("Quantas questões terá o cartão-resposta? ").strip())
-            if q < 1:
-                raise ValueError
-            return q
-        except ValueError:
-            print("❌ Digite um número válido (maior que 0).")
-
+# =========================
 # CONFIGURAÇÕES
 # =========================
 OUT_DIR = "saida_pdfs"
-CSV_PATH = "alunos/alunos.csv"
-
-# =========================
-# MARCADORES AO REDOR DO CARTÃO
-# =========================
-CARD_MARKER_SIZE = 6 * mm          # tamanho do quadradinho preto
-CARD_MARKER_OFFSET = 2 * mm        # distância do quadrado para fora da borda do cartão
+JSON_PATH = "alunos/alunos.json"
 
 # Logos (coloque seus arquivos aqui)
 LOGO_ESCOLA_PATH = "logos/logo_escola.png"
@@ -40,27 +22,33 @@ LOGO_GOVERNO_PATH = "logos/logo_governo.png"
 PROVA_DATA = "2026-02-23"
 PROVA_SEQ_START = 1
 
-QUESTOES = perguntar_quantidade_questoes()
-ALTERNATIVAS = ["A", "B", "C", "D"]
+# ✅ FIXO conforme solicitado
+QUESTOES_OBJETIVAS = 14          # 1 a 14 (bolinhas)
+DISSERTATIVAS_INICIO = 15        # 15 a 20
+DISSERTATIVAS_FIM = 20
+LINHAS_POR_DISSERTATIVA = 3      # ✅ 3 linhas por questão dissertativa
+
+ALTERNATIVAS = ["A", "B", "C", "D", "E"]
 
 PAGE_W, PAGE_H = A4
 MARGIN = 15 * mm
 
-# QR
-QR_SIZE = 28 * mm
-QR_X = PAGE_W - MARGIN - QR_SIZE
-QR_Y = PAGE_H - MARGIN - 95 * mm
+# =========================
+# MARCADORES AO REDOR DO CARTÃO (mantidos)
+# =========================
+CARD_MARKER_SIZE = 4 * mm      # menor
+CARD_MARKER_OFFSET = 2.5 * mm
 
 
 # =========================
-# CSV alunos
+# CSV alunos (aluno, serie, turma)
 # =========================
 def ler_alunos_csv(csv_path: str):
     csv_file = Path(csv_path)
     if not csv_file.exists():
         raise FileNotFoundError(
             f"Arquivo CSV não encontrado: {csv_file.resolve()}\n"
-            "Crie um 'alunos.csv' com colunas: aluno, serie, turma"
+            "Crie um 'alunos.json' com colunas: aluno, serie, turma"
         )
 
     alunos = []
@@ -86,29 +74,33 @@ def sanitizar_nome_arquivo(nome: str) -> str:
     limpo = limpo.replace(" ", "_")
     return limpo or "aluno"
 
+def ler_turmas_json(json_path: str):
+    json_file = Path(json_path)
+    if not json_file.exists():
+        raise FileNotFoundError(
+            f"Arquivo JSON não encontrado: {json_file.resolve()}"
+        )
 
-# =========================
-# QR code (PIL -> bytes)
-# =========================
-def gerar_qr_bytes(payload: dict) -> BytesIO:
-    data_str = json.dumps(payload, ensure_ascii=False)
+    with open(json_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=8,
-        border=2,
-    )
-    qr.add_data(data_str)
-    qr.make(fit=True)
+    turmas = []
 
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    for item in data:
+        serie = str(item.get("serie", "")).strip()
+        turma = str(item.get("turma", "")).strip()
+        quantidade = int(item.get("quantidade", 0))
 
-    bio = BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
+        if not serie or not turma or quantidade <= 0:
+            continue
 
+        turmas.append({
+            "serie": serie,
+            "turma": turma,
+            "quantidade": quantidade
+        })
+
+    return turmas
 
 # =========================
 # DESENHO DO PDF
@@ -116,10 +108,9 @@ def gerar_qr_bytes(payload: dict) -> BytesIO:
 def draw_header(c: canvas.Canvas, nome_escola: str, ano: str, aluno: str, turma: str, numero: str):
     header_h = 32 * mm
     x0 = MARGIN
-    y0 = PAGE_H - MARGIN - header_h
+    y0 = PAGE_H - (MARGIN - 5 * mm) - header_h
     w = PAGE_W - 2 * MARGIN
 
-    # Caixa externa
     c.setLineWidth(1)
     c.rect(x0, y0, w, header_h, stroke=1, fill=0)
 
@@ -135,7 +126,6 @@ def draw_header(c: canvas.Canvas, nome_escola: str, ano: str, aluno: str, turma:
             mask="auto",
             )
     else:
-        # placeholder se não achar a logo
         c.setLineWidth(1)
         c.rect(x0 + 4 * mm, y0 + 6 * mm, 22 * mm, 20 * mm, stroke=1, fill=0)
         c.setFont("Helvetica", 7)
@@ -166,7 +156,7 @@ def draw_header(c: canvas.Canvas, nome_escola: str, ano: str, aluno: str, turma:
     c.drawCentredString(PAGE_W / 2, y0 + header_h - 14 * mm, "ENSINO MÉDIO")
 
     c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(PAGE_W / 2, y0 + header_h - 20 * mm, f"LINGUA PORTUGUESA – {ano}")
+    c.drawCentredString(PAGE_W / 2, y0 + header_h - 20 * mm, f"LINGUA PORTUGUESA - PROVA")
 
     # Campos Aluno / Turma / Nº
     fields_y = y0 - 10 * mm
@@ -175,17 +165,19 @@ def draw_header(c: canvas.Canvas, nome_escola: str, ano: str, aluno: str, turma:
     c.drawString(MARGIN, fields_y, "Aluno(a):")
     c.line(MARGIN + 18 * mm, fields_y - 1.5 * mm, PAGE_W - MARGIN - 70 * mm, fields_y - 1.5 * mm)
 
+    c.drawString(PAGE_W - MARGIN - 25 * mm, fields_y, "Sérieº:")
+    c.line(PAGE_W - MARGIN - 17 * mm, fields_y - 1.5 * mm, PAGE_W - MARGIN, fields_y - 1.5 * mm)
+
     c.drawString(PAGE_W - MARGIN - 66 * mm, fields_y, "Turma:")
     c.line(PAGE_W - MARGIN - 50 * mm, fields_y - 1.5 * mm, PAGE_W - MARGIN - 28 * mm, fields_y - 1.5 * mm)
 
-    c.drawString(PAGE_W - MARGIN - 25 * mm, fields_y, "Nº:")
-    c.line(PAGE_W - MARGIN - 17 * mm, fields_y - 1.5 * mm, PAGE_W - MARGIN, fields_y - 1.5 * mm)
+
 
     # Valores
     c.setFont("Helvetica-Bold", 9)
-    c.drawString(MARGIN + 20 * mm, fields_y, (aluno or "")[:45])
+    c.drawString(MARGIN + 20 * mm, fields_y, "")
+    c.drawString(PAGE_W - MARGIN - 14 * mm, fields_y, (ano or "")[:6])
     c.drawString(PAGE_W - MARGIN - 45 * mm, fields_y, (turma or "")[:10])
-    c.drawString(PAGE_W - MARGIN - 14 * mm, fields_y, (numero or "")[:6])
 
 
 def draw_instructions(c: canvas.Canvas):
@@ -196,54 +188,61 @@ def draw_instructions(c: canvas.Canvas):
     c.setFont("Helvetica", 8)
 
     bullets = [
-        f"Este BLOCO contém {QUESTOES} questões.",
-        "Cada componente curricular possui o valor de 6,0 pontos.",
+        f"Este BLOCO contém {QUESTOES_OBJETIVAS} questões objetivas (1 a {QUESTOES_OBJETIVAS}).",
+        f"As questões {DISSERTATIVAS_INICIO} a {DISSERTATIVAS_FIM} são dissertativas (responda nas linhas).",
         "Questões objetivas: assinale uma alternativa.",
         "Preencha o círculo completamente e com nitidez, com CANETA TINTA AZUL OU PRETA.",
         "Marque apenas uma opção. Qualquer rasura pode ser considerada nula.",
+        "Cada questão dissertativa possui 3 linhas para resposta.",
     ]
     for b in bullets:
         c.drawString(MARGIN + 2 * mm, y, f"- {b}")
         y -= 4.5 * mm
 
 
-def draw_qr(c: canvas.Canvas, payload: dict):
-    bio = gerar_qr_bytes(payload)
-    img = ImageReader(bio)
-    c.drawImage(img, QR_X, QR_Y, width=QR_SIZE, height=QR_SIZE, mask="auto")
-    c.setFont("Helvetica", 7)
-    c.drawString(QR_X, QR_Y - 8, (payload.get("provaId", "") or "")[:30])
-def draw_answer_card(c: canvas.Canvas, questoes: int):
-    # =========================
-    # MAIS PRA CIMA (SEM CORTAR)
-    # =========================
-    y_title = 185 * mm  # sobe o bloco (antes 130mm)
+def draw_card_corner_markers(c: canvas.Canvas, card_x: float, card_y: float, card_w: float, card_h: float):
+    """
+    Desenha 4 quadrados pretos DENTRO do cartão-resposta (um em cada canto interno).
+    card_x, card_y = canto inferior esquerdo do cartão
+    """
+    tam = CARD_MARKER_SIZE
+    pad = CARD_MARKER_OFFSET  # agora é "padding" interno
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(PAGE_W / 2, y_title, "LINGUA PORTUGUESA")
+    # posições internas
+    tl = (card_x + pad,               card_y + card_h - pad - tam)   # top-left
+    tr = (card_x + card_w - pad - tam, card_y + card_h - pad - tam) # top-right
+    bl = (card_x + pad,               card_y + pad)                 # bottom-left
+    br = (card_x + card_w - pad - tam, card_y + pad)                # bottom-right
+
+    c.saveState()
+    c.setFillColor(colors.black)
+    c.setStrokeColor(colors.black)
+
+    for (x, y) in (tl, tr, bl, br):
+        c.rect(x, y, tam, tam, stroke=0, fill=1)
+
+    c.restoreState()
+
+
+def draw_answer_card_objetivas(c: canvas.Canvas, questoes: int):
+    # Mantive sua posição alta pra caber as dissertativas abaixo
+    y_title = 210 * mm
 
     c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(PAGE_W / 2, y_title - 6 * mm, "CARTÃO - RESPOSTA")
+    row_h = 6 * mm
+    col_w = 9.5 * mm
+    circle_r = 2.0 * mm
 
-    # =========================
-    # CARTÃO (COMPACTADO)
-    # =========================
-    row_h = 6 * mm          # ✅ antes 7mm (isso era o que fazia cortar)
-    col_w = 9.5 * mm        # um pouco menor para ficar proporcional
-    circle_r = 2.0 * mm     # levemente menor
-
-    card_w = 78 * mm        # um pouco menor que 80 pra ficar mais “oficial”
+    card_w = 78 * mm
     card_h = (questoes + 2) * row_h
 
     card_x = (PAGE_W - card_w) / 2
-    card_y = (y_title - 12 * mm) - card_h  # mantém proporcional ao título
+    card_y = (y_title - 12 * mm) - card_h
 
-    # Borda
     c.setLineWidth(1)
     c.rect(card_x, card_y, card_w, card_h, stroke=1, fill=0)
     draw_card_corner_markers(c, card_x, card_y, card_w, card_h)
 
-    # Cabeçalho A B C D
     start_x = card_x + 22 * mm
     header_y = card_y + card_h - 1.5 * row_h
 
@@ -252,7 +251,6 @@ def draw_answer_card(c: canvas.Canvas, questoes: int):
         cx = start_x + j * col_w
         c.drawCentredString(cx, header_y + 2.6 * mm, letra)
 
-    # Linhas
     c.setFont("Helvetica", 8)
     y = header_y - row_h
 
@@ -264,59 +262,66 @@ def draw_answer_card(c: canvas.Canvas, questoes: int):
             cy = y + 2.7 * mm
             c.circle(cx, cy, circle_r, stroke=1, fill=0)
 
-        # Linha separadora leve
-        c.setStrokeColor(colors.lightgrey)
-        c.setLineWidth(0.5)
-        c.line(card_x + 2 * mm, y, card_x + card_w - 2 * mm, y)
-
-        c.setStrokeColor(colors.black)
-        c.setLineWidth(1)
-
         y -= row_h
-def draw_card_corner_markers(c: canvas.Canvas, card_x: float, card_y: float, card_w: float, card_h: float):
+
+    # Retorna o Y do fim do cartão pra posicionar as dissertativas
+    return card_y - 4 * mm
+
+
+def draw_dissertativas(c: canvas.Canvas, start_q: int, end_q: int, y_start: float, linhas_por: int = 3):
     """
-    Desenha 4 quadrados pretos nos cantos do cartão-resposta (ao redor do retângulo do cartão).
-    card_x, card_y = canto inferior esquerdo do cartão
+    Desenha o bloco de dissertativas (15 a 20) com 3 linhas para cada.
     """
-    tam = CARD_MARKER_SIZE
-    off = CARD_MARKER_OFFSET
+    y = y_start
 
-    # Posições (quadrado fora do retângulo, como na sua imagem)
-    tl = (card_x - off - tam, card_y + card_h + off)          # top-left
-    tr = (card_x + card_w + off, card_y + card_h + off)       # top-right
-    bl = (card_x - off - tam, card_y - off - tam)             # bottom-left
-    br = (card_x + card_w + off, card_y - off - tam)          # bottom-right
+    line_w = PAGE_W - 2 * MARGIN
+    line_gap = 5.0 * mm   # linhas mais próximas
+    block_gap = 2.0 * mm    # espaço entre uma questão e outra
 
-    c.saveState()
-    c.setFillColor(colors.black)
-    c.setStrokeColor(colors.black)
+    c.setFont("Helvetica", 9)
+    for q in range(start_q, end_q + 1):
+        # número da questão
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(MARGIN, y, f"{q})")
+        c.setFont("Helvetica", 9)
 
-    for (x, y) in (tl, tr, bl, br):
-        c.rect(x, y, tam, tam, stroke=0, fill=1)
+        # linhas (3)
+        x1 = MARGIN + 10 * mm
+        x2 = MARGIN + line_w
+        for _ in range(linhas_por):
+            c.line(x1, y - 1.2 * mm, x2, y - 1.2 * mm)
+            y -= line_gap
 
-    c.restoreState()
+        y -= block_gap
 
-def gerar_pdf_aluno(out_path: str, aluno: dict, prova_id: str, numero: str):
+    return y
+
+
+def gerar_pdf_cartao(out_path: str, serie: str, turma: str, numero: str):
     c = canvas.Canvas(out_path, pagesize=A4)
+
     draw_header(
         c,
         nome_escola="COLEGIO ESTADUAL MARIA ABADIA MEIRELES SHINOHARA",
-        ano=aluno.get("serie", ""),
-        aluno=aluno.get("aluno", ""),
-        turma=aluno.get("turma", ""),
+        ano=serie,
+        aluno="",            # vazio
+        turma=turma,
         numero=numero,
     )
 
     draw_instructions(c)
 
-    payload = {
-        "aluno": aluno.get("aluno", ""),
-        "serie": aluno.get("serie", ""),
-        "turma": aluno.get("turma", ""),
-        "provaId": prova_id,
-    }
-    draw_qr(c, payload)
-    draw_answer_card(c, questoes=QUESTOES)
+    # ✅ Objetivas 1..14
+    y_after_card = draw_answer_card_objetivas(c, questoes=QUESTOES_OBJETIVAS)
+
+    # ✅ Dissertativas 15..20 com 3 linhas
+    draw_dissertativas(
+        c,
+        start_q=DISSERTATIVAS_INICIO,
+        end_q=DISSERTATIVAS_FIM,
+        y_start=y_after_card,
+        linhas_por=LINHAS_POR_DISSERTATIVA
+    )
 
     c.showPage()
     c.save()
@@ -326,27 +331,37 @@ def gerar_pdf_aluno(out_path: str, aluno: dict, prova_id: str, numero: str):
 # MAIN
 # =========================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", required=True, help="Caminho do arquivo turmas.json")
+    parser.add_argument("--out", required=True, help="Pasta de saída dos PDFs")
+    args = parser.parse_args()
+
+    JSON_PATH = args.json
+    OUT_DIR = args.out
+
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    alunos = ler_alunos_csv(CSV_PATH)
-    if not alunos:
-        raise RuntimeError("Nenhum aluno encontrado no CSV.")
+    turmas = ler_turmas_json(JSON_PATH)
+    if not turmas:
+        raise RuntimeError("Nenhuma turma encontrada no JSON.")
 
-    print(f"👥 {len(alunos)} alunos carregados do CSV")
-    print(f"📝 Questões: {QUESTOES}")
-    print("🖼️ Logo escola:", os.path.abspath(LOGO_ESCOLA_PATH))
-    print("🖼️ Logo governo:", os.path.abspath(LOGO_GOVERNO_PATH))
+    contador_global = PROVA_SEQ_START
 
-    for idx, aluno in enumerate(alunos, start=PROVA_SEQ_START):
-        prova_id = f"{PROVA_DATA}-{idx:03d}"
-        numero = str(idx)
+    for turma in turmas:
+        serie = turma["serie"]
+        nome_turma = turma["turma"]
+        qtd = int(turma["quantidade"])
 
-        nome_arq = sanitizar_nome_arquivo(aluno["aluno"])
-        out_file = os.path.join(OUT_DIR, f"cartao_resposta_{nome_arq}_{prova_id}.pdf")
+        for i in range(1, qtd + 1):
+            numero = str(i)
+            prova_id = f"{PROVA_DATA}-{contador_global:03d}"
 
-        gerar_pdf_aluno(out_file, aluno, prova_id, numero)
-        print("✅ PDF gerado:", out_file)
+            out_file = os.path.join(
+                OUT_DIR,
+                f"cartao_resposta_{serie.replace(' ', '')}_T{nome_turma}_{numero}_{prova_id}.pdf"
+            )
 
-    print("\n✅ Finalizado!")
-    print("📁 Pasta de saída:", os.path.abspath(OUT_DIR))
-    print("📄 CSV usado:", os.path.abspath(CSV_PATH))
+            gerar_pdf_cartao(out_file, serie, nome_turma, numero)
+            contador_global += 1
+
+    print(os.path.abspath(OUT_DIR))
