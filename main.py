@@ -9,13 +9,11 @@ import json
 import zipfile
 
 # ✅ IMPORTA DO SEU ARQUIVO DE PROCESSAMENTO (ajuste se o nome do arquivo for outro)
+print(">>> Importando gerar_gabarito...")
 from gerar_gabarito import gerar_pdf_cartao, PROVA_DATA, PROVA_SEQ_START
-
-from ler_gabarito import (
-    ler_gabarito_csv,
-    carregar_imagem_bytes,
-    corrigir_imagem,
-)
+print(">>> Importando ler_gabarito...")
+from ler_gabarito import ler_gabarito_csv, carregar_imagem_bytes, corrigir_imagem
+print(">>> Imports do projeto OK")
 
 app = FastAPI()
 
